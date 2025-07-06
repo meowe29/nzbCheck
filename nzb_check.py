@@ -4,57 +4,85 @@ import xml.etree.ElementTree as ET
 import argparse
 from tqdm.asyncio import tqdm_asyncio
 
-async def check_article(session_id, semaphore, server_config, article_id):
+async def check_article(semaphore, server_config, article_id, verbose=False):
     """
     Connects to the Usenet server and checks for a single article's existence.
     Returns the article_id and a boolean indicating if it was found.
     """
     host, port, username, password, use_ssl = server_config
-    
+    reader, writer = None, None # Define here to access in finally block
+
+    async def verbose_print(msg):
+        if verbose:
+            print(f"[VERBOSE] {msg}")
+
     try:
         async with semaphore:
-            # Establish connection
+            # 1. Establish connection
+            await verbose_print(f"Connecting to {host}:{port}...")
             ssl_context = ssl.create_default_context() if use_ssl else None
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port, ssl=ssl_context),
                 timeout=15
             )
 
-            # Read initial welcome message
-            await reader.read(1024)
+            # 2. Read initial welcome message
+            response = await asyncio.wait_for(reader.readline(), timeout=15)
+            await verbose_print(f"Server Welcome: {response.decode(errors='ignore').strip()}")
+            if not response.startswith(b"200"):
+                 return article_id, None
 
-            # Authenticate
+            # 3. Authenticate
             if username:
+                await verbose_print("Authenticating...")
                 writer.write(f"AUTHINFO USER {username}\r\n".encode())
                 await writer.drain()
-                await reader.read(1024) # Server response
+                response = await asyncio.wait_for(reader.readline(), timeout=15)
+                await verbose_print(f"User Auth Resp: {response.decode(errors='ignore').strip()}")
+
                 writer.write(f"AUTHINFO PASS {password}\r\n".encode())
                 await writer.drain()
-                await reader.read(1024) # Server response
+                response = await asyncio.wait_for(reader.readline(), timeout=15)
+                await verbose_print(f"Pass Auth Resp: {response.decode(errors='ignore').strip()}")
+                if not response.startswith(b"281"):
+                    return article_id, None
 
-            # Check for article existence with STAT command
-            writer.write(f"STAT <{article_id}>\r\n".encode())
+            # 4. Check for article existence with STAT command
+            check_command = f"STAT <{article_id}>\r\n"
+            await verbose_print(f"Sending: {check_command.strip()}")
+            writer.write(check_command.encode())
             await writer.drain()
-            
-            response = await asyncio.wait_for(reader.read(1024), timeout=15)
-            
-            # Close the connection
-            writer.write(b"QUIT\r\n")
-            await writer.drain()
-            writer.close()
-            await writer.wait_closed()
-            
+
+            response = await asyncio.wait_for(reader.readline(), timeout=15)
+            await verbose_print(f"STAT Resp: {response.decode(errors='ignore').strip()}")
+
             # 223 means the article exists. 430 means it does not.
             if response.startswith(b"223"):
                 return article_id, True
             else:
                 return article_id, False
 
-    except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as e:
-        # Handle connection errors or timeouts
-        return article_id, None # None indicates an error
-    except Exception as e:
+    except asyncio.TimeoutError:
+        await verbose_print(f"Timeout for article {article_id}")
         return article_id, None
+    except Exception as e:
+        await verbose_print(f"An unexpected error occurred for article {article_id}: {e}")
+        return article_id, None
+    finally:
+        # 5. Gracefully close the connection
+        if writer:
+            try:
+                writer.write(b"QUIT\r\n")
+                await writer.drain()
+                # Try to read the final goodbye message from the server
+                await asyncio.wait_for(reader.readline(), timeout=5)
+            except (asyncio.TimeoutError, BrokenPipeError, IOError):
+                # Ignore errors during shutdown, as the connection might already be closed
+                pass
+            finally:
+                writer.close()
+                await writer.wait_closed()
+                await verbose_print("Connection closed.")
 
 
 def parse_nzb(nzb_path):
@@ -62,18 +90,14 @@ def parse_nzb(nzb_path):
     try:
         tree = ET.parse(nzb_path)
         root = tree.getroot()
-        # NZB files use a namespace, which we need to handle
         namespace = {'nzb': 'http://www.newzbin.com/DTD/2003/nzb'}
         article_ids = [
             segment.text
             for segment in root.findall(".//nzb:segment", namespace)
         ]
-        return list(set(article_ids)) # Return unique IDs
-    except ET.ParseError:
-        print(f"Error: Could not parse '{nzb_path}'. Is it a valid XML/NZB file?")
-        return []
-    except FileNotFoundError:
-        print(f"Error: File not found at '{nzb_path}'")
+        return list(set(article_ids))
+    except Exception as e:
+        print(f"Error parsing NZB file: {e}")
         return []
 
 async def main(args):
@@ -99,12 +123,11 @@ async def main(args):
 
     semaphore = asyncio.Semaphore(args.connections)
     tasks = [
-        check_article(i, semaphore, server_config, article_id)
-        for i, article_id in enumerate(article_ids)
+        check_article(semaphore, server_config, article_id, args.verbose)
+        for article_id in article_ids
     ]
 
     results = []
-    # Use tqdm for a nice progress bar
     for future in tqdm_asyncio.as_completed(tasks, total=total_articles):
         result = await future
         results.append(result)
@@ -125,10 +148,10 @@ async def main(args):
 
     print("\n--- Check Complete ---")
     print(f"Total Articles: {total_articles}")
-    print(f"  \033[92mFound: {found_count}\033[0m") # Green text
-    print(f"  \033[91mMissing: {missing_count}\033[0m") # Red text
+    print(f"  \033[92mFound: {found_count}\033[0m")
+    print(f"  \03f[91mMissing: {missing_count}\033[0m")
     if error_count > 0:
-        print(f"  \033[93mErrors (Timeouts/Connection Failed): {error_count}\033[0m") # Yellow text
+        print(f"  \033[93mErrors (Timeouts/Connection Failed): {error_count}\033[0m")
 
     completion_percentage = (found_count / total_articles) * 100 if total_articles > 0 else 0
     print(f"Completion Rate: {completion_percentage:.2f}%")
@@ -143,14 +166,15 @@ if __name__ == "__main__":
         description="A fast, concurrent Usenet NZB completion checker."
     )
     parser.add_argument("nzb_file", help="Path to the .nzb file to check.")
-    parser.add_argument("-s", "--server", required=True, help="Usenet server address (e.g., news.your-provider.com).")
+    parser.add_argument("-s", "--server", required=True, help="Usenet server address.")
     parser.add_argument("-p", "--port", type=int, default=563, help="Server port (default: 563 for SSL).")
     parser.add_argument("-u", "--username", help="Your Usenet username.")
     parser.add_argument("-pw", "--password", help="Your Usenet password.")
-    parser.add_argument("-c", "--connections", type=int, default=50, help="Number of concurrent connections to use (default: 50).")
-    parser.add_argument("--no-ssl", action="store_true", help="Disable SSL for the connection (e.g., for port 119).")
-    parser.add_argument("--show-missing", action="store_true", help="Print the list of all missing article IDs at the end.")
-    
+    parser.add_argument("-c", "--connections", type=int, default=50, help="Number of concurrent connections.")
+    parser.add_argument("--no-ssl", action="store_true", help="Disable SSL for the connection.")
+    parser.add_argument("--show-missing", action="store_true", help="Print the list of all missing article IDs.")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output for debugging connection issues.")
+
     args = parser.parse_args()
     
     try:
